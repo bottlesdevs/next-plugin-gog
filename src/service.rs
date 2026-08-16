@@ -23,9 +23,10 @@ use next_proto::bottles::{
     common::v1::{AuthState, Game, LinkedAccount, Storefront},
     library::v1::{GameAdded, GameEvent, GameRemoved, game_event},
     store::v1::{
-        BeginLoginRequest, CompleteLoginRequest, ListGamesRequest, ListGamesResponse,
-        LoginChallenge, OAuthRedirectChallenge, RefreshSessionRequest, RevokeSessionRequest,
-        WatchGamesRequest, login_challenge::Kind, store_server::Store,
+        BeginLoginRequest, CompleteLoginRequest, GetInstallManifestRequest, InstallFile,
+        InstallManifest, ListGamesRequest, ListGamesResponse, LoginChallenge,
+        OAuthRedirectChallenge, RefreshSessionRequest, RevokeSessionRequest, WatchGamesRequest,
+        login_challenge::Kind, store_server::Store,
     },
 };
 use tokio::sync::{RwLock, mpsc};
@@ -187,6 +188,7 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
                             .as_deref()
                             .and_then(gamesdb::parse_release_date),
                         rating: release.game.aggregated_rating.map(|score| score.to_string()),
+                        install_state: None,
                     },
                     Err(err) => {
                         tracing::warn!("GamesDB fetch_release({id}) failed: {err}");
@@ -203,6 +205,7 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
                             genres: Vec::new(),
                             release_date: None,
                             rating: None,
+                            install_state: None,
                         }
                     }
                 })
@@ -418,6 +421,113 @@ impl<C: CredentialStore + Send + Sync + 'static> Store for GogStoreService<C> {
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+
+    /// Resolves the Windows build's file list for `game_id` into
+    /// ready-to-download URLs, following GOG's manual-download redirect
+    /// chain for each file the same way `gog::Gog::download_game` does,
+    /// except we only need the resolved URL, not the response body.
+    async fn get_install_manifest(
+        &self,
+        request: Request<GetInstallManifestRequest>,
+    ) -> Result<Response<InstallManifest>, Status> {
+        let req = request.into_inner();
+        let game_id: i64 = req
+            .game_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("game_id must be a GOG numeric product id"))?;
+
+        let stored = self
+            .credentials
+            .load(&req.profile_id, Storefront::Gog)
+            .await
+            .map_err(error::credentials)?
+            .ok_or_else(|| error::credentials(CredentialError::NotFound))?;
+        let token: Token = serde_json::from_slice(&stored).map_err(error::json)?;
+
+        tokio::task::spawn_blocking(move || {
+            let gog = Gog::new(token);
+            let details = gog.get_game_details(game_id).map_err(error::api)?;
+            let downloads = details.downloads.windows.ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "no Windows build available for GOG game {game_id}"
+                ))
+            })?;
+
+            let version = downloads
+                .first()
+                .and_then(|download| download.version.clone())
+                .unwrap_or_default();
+
+            let mut files = Vec::with_capacity(downloads.len());
+            let mut install_size_bytes = Some(0u64);
+            for download in downloads {
+                let resolved_url = resolve_download_url(&gog, &download.manual_url)
+                    .map_err(|err| Status::unavailable(format!("GOG download resolution failed for {}: {err}", download.name)))?;
+                let relative_path = resolved_url
+                    .rsplit('/')
+                    .next()
+                    .and_then(|segment| segment.split('?').next())
+                    .filter(|segment| !segment.is_empty())
+                    .unwrap_or(&download.name)
+                    .to_string();
+                let size_bytes = parse_size(&download.size);
+                install_size_bytes = install_size_bytes.zip(size_bytes).map(|(a, b)| a + b);
+
+                files.push(InstallFile {
+                    relative_path,
+                    download_url: resolved_url,
+                    size_bytes,
+                });
+            }
+
+            Ok(InstallManifest {
+                version,
+                install_size_bytes,
+                files,
+            })
+        })
+        .await
+        .map_err(|err| Status::internal(format!("GOG worker task panicked: {err}")))?
+        .map(Response::new)
+    }
+}
+
+/// Follows GOG's manual-download redirect chain to the final CDN URL,
+/// mirroring `gog::Gog::download_game`'s own redirect-following (it
+/// isn't reusable here since it returns a live `Response`, not the URL,
+/// and we don't want to actually start fetching the body yet).
+// Uses gog's own vendored reqwest (currently 0.11, distinct from the
+// reqwest this workspace otherwise depends on) via `gog::Result`, since
+// `gog::Gog::client_noredirect` is that crate's own `reqwest::blocking`
+// client — mixing in our reqwest's types here wouldn't type-check.
+fn resolve_download_url(gog: &Gog, manual_url: &str) -> gog::Result<String> {
+    let mut url = format!("{}{manual_url}", gog::gog::domains::BASE);
+    loop {
+        let response = gog.client_noredirect.borrow().get(&url).send()?;
+        match response.headers().get("location") {
+            Some(location) => {
+                url = location.to_str().unwrap_or_default().to_string();
+            }
+            None => return Ok(response.url().to_string()),
+        }
+    }
+}
+
+/// Parses GOG's human-readable size strings (e.g. `"1.2 GB"`, `"620 MB"`)
+/// into bytes. Best-effort — returns `None` on any format surprise rather
+/// than failing the whole manifest over decorative size info.
+fn parse_size(size: &str) -> Option<u64> {
+    let (value, unit) = size.trim().rsplit_once(' ')?;
+    let value: f64 = value.parse().ok()?;
+    let multiplier = match unit.to_ascii_uppercase().as_str() {
+        "B" => 1.0,
+        "KB" => 1024.0,
+        "MB" => 1024.0 * 1024.0,
+        "GB" => 1024.0 * 1024.0 * 1024.0,
+        "TB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((value * multiplier) as u64)
 }
 
 /// URL-encodes `GOG_REDIRECT_URI` for embedding in the auth URL's query
