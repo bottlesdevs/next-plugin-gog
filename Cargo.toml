@@ -30,3 +30,5 @@ gog.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json"] }
 chrono.workspace = true
 prost-wkt-types = "0.7.1"
+flate2.workspace = true
+thiserror.workspace = true

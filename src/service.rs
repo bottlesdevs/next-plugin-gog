@@ -23,7 +23,7 @@ use next_proto::bottles::{
     common::v1::{AuthState, Game, LinkedAccount, Storefront},
     library::v1::{GameAdded, GameEvent, GameRemoved, game_event},
     store::v1::{
-        BeginLoginRequest, CompleteLoginRequest, GetInstallManifestRequest, InstallFile,
+        BeginLoginRequest, Chunk, CompleteLoginRequest, GetInstallManifestRequest, InstallFile,
         InstallManifest, ListGamesRequest, ListGamesResponse, LoginChallenge,
         OAuthRedirectChallenge, RefreshSessionRequest, RevokeSessionRequest, WatchGamesRequest,
         login_challenge::Kind, store_server::Store,
@@ -35,7 +35,7 @@ use tonic::{Request, Response, Status, async_trait};
 use uuid::Uuid;
 
 use crate::{
-    error,
+    depot, error,
     gamesdb::{self, Image, Localized},
 };
 
@@ -454,10 +454,15 @@ impl<C: CredentialStore + Send + Sync + 'static> Store for GogStoreService<C> {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
-    /// Resolves the Windows build's file list for `game_id` into
-    /// ready-to-download URLs, following GOG's manual-download redirect
-    /// chain for each file the same way `gog::Gog::download_game` does,
-    /// except we only need the resolved URL, not the response body.
+    /// Resolves `game_id`'s current Windows build via GOG's builds/depot
+    /// v2 API (`crate::depot`) — the same chunked-file-manifest system
+    /// `heroic-gogdl` uses, not the legacy `embed.gog.com` installer
+    /// this used to hit. No installer ever runs: every file in the
+    /// response is downloaded and written directly at its relative
+    /// path. `primary_executable` is left unset — GOG doesn't expose it
+    /// in the manifest, only inside a `goggame-<id>.info` file that
+    /// ships as one of the depot's own files (see `store.proto`'s doc
+    /// comment on `InstallManifest.primary_executable`).
     async fn get_install_manifest(
         &self,
         request: Request<GetInstallManifestRequest>,
@@ -476,95 +481,90 @@ impl<C: CredentialStore + Send + Sync + 'static> Store for GogStoreService<C> {
             .ok_or_else(|| error::credentials(CredentialError::NotFound))?;
         let token: Token = serde_json::from_slice(&stored).map_err(error::json)?;
 
-        tokio::task::spawn_blocking(move || {
+        // The depot API needs a fresh access token; `gog`'s own client
+        // transparently refreshes on any authenticated call, so make a
+        // cheap one and persist the (possibly refreshed) token, same as
+        // `verify_session` does.
+        let refreshed = tokio::task::spawn_blocking(move || {
             let gog = Gog::new(token);
-            let details = gog.get_game_details(game_id).map_err(error::api)?;
-            let downloads = details.downloads.windows.ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "no Windows build available for GOG game {game_id}"
-                ))
-            })?;
-
-            let version = downloads
-                .first()
-                .and_then(|download| download.version.clone())
-                .unwrap_or_default();
-
-            let mut files = Vec::with_capacity(downloads.len());
-            let mut install_size_bytes = Some(0u64);
-            for download in downloads {
-                let resolved_url =
-                    resolve_download_url(&gog, &download.manual_url).map_err(|err| {
-                        Status::unavailable(format!(
-                            "GOG download resolution failed for {}: {err}",
-                            download.name
-                        ))
-                    })?;
-                let relative_path = resolved_url
-                    .rsplit('/')
-                    .next()
-                    .and_then(|segment| segment.split('?').next())
-                    .filter(|segment| !segment.is_empty())
-                    .unwrap_or(&download.name)
-                    .to_string();
-                let size_bytes = parse_size(&download.size);
-                install_size_bytes = install_size_bytes.zip(size_bytes).map(|(a, b)| a + b);
-
-                files.push(InstallFile {
-                    relative_path,
-                    download_url: resolved_url,
-                    size_bytes,
-                });
-            }
-
-            Ok(InstallManifest {
-                version,
-                install_size_bytes,
-                files,
-            })
+            gog.get_user_data().map_err(error::session_invalid)?;
+            Ok::<_, Status>(gog.token.borrow().clone())
         })
         .await
-        .map_err(|err| Status::internal(format!("GOG worker task panicked: {err}")))?
-        .map(Response::new)
-    }
-}
+        .map_err(|err| Status::internal(format!("GOG worker task panicked: {err}")))??;
+        self.credentials
+            .save(
+                &req.profile_id,
+                Storefront::Gog,
+                &serde_json::to_vec(&refreshed).map_err(error::json)?,
+            )
+            .await
+            .map_err(error::credentials)?;
 
-/// Follows GOG's manual-download redirect chain to the final CDN URL,
-/// mirroring `gog::Gog::download_game`'s own redirect-following (it
-/// isn't reusable here since it returns a live `Response`, not the URL,
-/// and we don't want to actually start fetching the body yet).
-// Uses gog's own vendored reqwest (currently 0.11, distinct from the
-// reqwest this workspace otherwise depends on) via `gog::Result`, since
-// `gog::Gog::client_noredirect` is that crate's own `reqwest::blocking`
-// client — mixing in our reqwest's types here wouldn't type-check.
-fn resolve_download_url(gog: &Gog, manual_url: &str) -> gog::Result<String> {
-    let mut url = format!("{}{manual_url}", gog::gog::domains::BASE);
-    loop {
-        let response = gog.client_noredirect.borrow().get(&url).send()?;
-        match response.headers().get("location") {
-            Some(location) => {
-                url = location.to_str().unwrap_or_default().to_string();
+        let http = reqwest::Client::new();
+        let access_token = &refreshed.access_token;
+
+        let builds = depot::get_builds(&http, access_token, game_id)
+            .await
+            .map_err(|err| Status::unavailable(format!("GOG builds lookup failed: {err}")))?;
+        let build = depot::select_build(&builds)
+            .ok_or_else(|| Status::not_found(format!("no builds available for GOG game {game_id}")))?;
+
+        let meta = depot::get_build_meta(&http, access_token, &build.link)
+            .await
+            .map_err(|err| Status::unavailable(format!("GOG build manifest fetch failed: {err}")))?;
+        let depot_meta = depot::select_depot(&meta).ok_or_else(|| {
+            Status::failed_precondition(format!("no compatible depot for GOG game {game_id}"))
+        })?;
+
+        let depot_files = depot::get_depot_files(&http, &depot_meta.manifest)
+            .await
+            .map_err(|err| Status::unavailable(format!("GOG depot manifest fetch failed: {err}")))?;
+        let secure_link = depot::get_secure_link(&http, access_token, game_id, "/")
+            .await
+            .map_err(|err| Status::unavailable(format!("GOG secure_link lookup failed: {err}")))?;
+
+        let mut files = Vec::with_capacity(depot_files.len());
+        let mut install_size_bytes = Some(0u64);
+        for depot_file in depot_files {
+            let mut chunks = Vec::with_capacity(depot_file.chunks.len());
+            let mut file_size = Some(0u64);
+            for chunk in depot_file.chunks {
+                let Some(download_url) = secure_link
+                    .iter()
+                    .find_map(|entry| depot::build_chunk_url(entry, &chunk.compressed_md5))
+                else {
+                    tracing::warn!(
+                        "no usable CDN endpoint for a chunk of {}, skipping",
+                        depot_file.path
+                    );
+                    continue;
+                };
+                file_size = file_size.zip(Some(chunk.size)).map(|(a, b)| a + b);
+                chunks.push(Chunk {
+                    download_url,
+                    compressed: true,
+                    size_bytes: Some(chunk.size),
+                    md5: Some(chunk.md5),
+                });
             }
-            None => return Ok(response.url().to_string()),
+            install_size_bytes = install_size_bytes.zip(file_size).map(|(a, b)| a + b);
+            files.push(InstallFile {
+                relative_path: depot_file.path,
+                size_bytes: file_size,
+                chunks,
+            });
         }
-    }
-}
 
-/// Parses GOG's human-readable size strings (e.g. `"1.2 GB"`, `"620 MB"`)
-/// into bytes. Best-effort — returns `None` on any format surprise rather
-/// than failing the whole manifest over decorative size info.
-fn parse_size(size: &str) -> Option<u64> {
-    let (value, unit) = size.trim().rsplit_once(' ')?;
-    let value: f64 = value.parse().ok()?;
-    let multiplier = match unit.to_ascii_uppercase().as_str() {
-        "B" => 1.0,
-        "KB" => 1024.0,
-        "MB" => 1024.0 * 1024.0,
-        "GB" => 1024.0 * 1024.0 * 1024.0,
-        "TB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
-    };
-    Some((value * multiplier) as u64)
+        Ok(Response::new(InstallManifest {
+            version: build.build_id.clone(),
+            install_size_bytes,
+            files,
+            install_directory: meta.install_directory,
+            primary_executable: None,
+            prerequisite: None,
+        }))
+    }
 }
 
 /// URL-encodes `GOG_REDIRECT_URI` for embedding in the auth URL's query
