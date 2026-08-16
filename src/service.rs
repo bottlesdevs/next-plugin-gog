@@ -33,7 +33,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, async_trait};
 use uuid::Uuid;
 
-use crate::error;
+use crate::{
+    error,
+    gamesdb::{self, Image, Localized},
+};
 
 /// GOG Galaxy's public client ID, used by every third-party GOG client
 /// (Heroic, Minigalaxy, Lutris, ...) since GOG has no per-application
@@ -125,13 +128,18 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
     }
 
     /// Loads this profile's stored GOG token and lists owned games,
-    /// fetching each game's title individually since GOG's owned-games
-    /// endpoint only returns IDs. Shared between `ListGames` and the
-    /// polling loop `WatchGames` spawns.
+    /// fetching each game's catalog data (title, description, cover)
+    /// individually since GOG's owned-games endpoint only returns IDs.
+    /// Shared between `ListGames` and the polling loop `WatchGames`
+    /// spawns.
     ///
-    /// This is one API call per owned game on top of the initial list
-    /// call, which is slow for large libraries — acceptable for now
-    /// given GOG doesn't offer a batched alternative.
+    /// Per-game data comes from GamesDB (`gamesdb::fetch_release`)
+    /// rather than the `gog` crate's `get_game_details`, which hits
+    /// `embed.gog.com/account/gameDetails` and rate-limits hard under
+    /// one-call-per-owned-game — after a handful of requests it starts
+    /// returning empty bodies instead of data. GamesDB is the same
+    /// public catalog data Heroic's launcher uses and tolerates this
+    /// access pattern.
     async fn fetch_games(credentials: &C, profile_id: &str) -> Result<Vec<Game>, Status> {
         let stored = credentials
             .load(profile_id, Storefront::Gog)
@@ -144,21 +152,37 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
         tokio::task::spawn_blocking(move || {
             let gog = Gog::new(token);
             let ids = gog.get_games().map_err(error::api)?;
+            let http = reqwest::blocking::Client::new();
 
             Ok(ids
                 .into_iter()
-                .map(|id| {
-                    let title = gog
-                        .get_game_details(id)
-                        .map(|details| details.title)
-                        .unwrap_or_else(|_| id.to_string());
-                    Game {
+                .map(|id| match gamesdb::fetch_release(&http, id) {
+                    Ok(release) => Game {
                         id: id.to_string(),
-                        title,
+                        title: release
+                            .title
+                            .resolve()
+                            .unwrap_or_else(|| id.to_string()),
                         storefront: Storefront::Gog as i32,
-                        description: None,
-                        icon_url: None,
-                        cover_url: None,
+                        description: release.summary.as_ref().and_then(Localized::resolve),
+                        icon_url: release.icon.as_ref().map(Image::resolve),
+                        cover_url: release
+                            .game
+                            .vertical_cover
+                            .as_ref()
+                            .or(release.game.cover.as_ref())
+                            .map(Image::resolve),
+                    },
+                    Err(err) => {
+                        tracing::warn!("GamesDB fetch_release({id}) failed: {err}");
+                        Game {
+                            id: id.to_string(),
+                            title: id.to_string(),
+                            storefront: Storefront::Gog as i32,
+                            description: None,
+                            icon_url: None,
+                            cover_url: None,
+                        }
                     }
                 })
                 .collect())

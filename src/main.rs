@@ -24,6 +24,7 @@ const REGISTRY_ENDPOINT: &str = "http://127.0.0.1:50250"; // core's Registry ser
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1); // < HEARTBEAT_TIMEOUT/2
 
 mod error;
+mod gamesdb;
 mod service;
 
 #[tokio::main]

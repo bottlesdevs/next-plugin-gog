@@ -24,5 +24,7 @@ next-proto.workspace = true
 tokio-stream = { workspace = true, features = ["sync"] }
 futures-core.workspace = true
 uuid.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 gog.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json"] }
