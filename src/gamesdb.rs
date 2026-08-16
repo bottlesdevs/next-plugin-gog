@@ -24,6 +24,25 @@ pub struct Release {
 pub struct GameDetails {
     pub cover: Option<Image>,
     pub vertical_cover: Option<Image>,
+    pub background: Option<Image>,
+    #[serde(default)]
+    pub developers: Vec<Company>,
+    #[serde(default)]
+    pub publishers: Vec<Company>,
+    #[serde(default)]
+    pub genres: Vec<Genre>,
+    pub first_release_date: Option<String>,
+    pub aggregated_rating: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Company {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Genre {
+    pub name: Localized,
 }
 
 /// GamesDB text fields are keyed by locale, with `"*"` as the
@@ -54,6 +73,15 @@ impl Image {
     pub fn resolve(&self) -> String {
         self.url_format.replace("{formatter}", "").replace("{ext}", "jpg")
     }
+}
+
+/// Parses GamesDB's `first_release_date` (e.g. `"2012-04-17T00:00:00+0000"`)
+/// into a proto `Timestamp`. Returns `None` on any format surprise rather
+/// than failing the whole game — this is decorative metadata.
+pub fn parse_release_date(date: &str) -> Option<prost_wkt_types::Timestamp> {
+    chrono::DateTime::parse_from_str(date, "%Y-%m-%dT%H:%M:%S%z")
+        .ok()
+        .map(|parsed| prost_wkt_types::Timestamp::from(std::time::SystemTime::from(parsed)))
 }
 
 /// Fetches a single release's catalog data by GOG product id. Blocking —

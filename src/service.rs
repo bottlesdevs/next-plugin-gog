@@ -172,6 +172,21 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
                             .as_ref()
                             .or(release.game.cover.as_ref())
                             .map(Image::resolve),
+                        background_url: release.game.background.as_ref().map(Image::resolve),
+                        developer: release.game.developers.first().map(|c| c.name.clone()),
+                        publisher: release.game.publishers.first().map(|c| c.name.clone()),
+                        genres: release
+                            .game
+                            .genres
+                            .iter()
+                            .filter_map(|genre| genre.name.resolve())
+                            .collect(),
+                        release_date: release
+                            .game
+                            .first_release_date
+                            .as_deref()
+                            .and_then(gamesdb::parse_release_date),
+                        rating: release.game.aggregated_rating.map(|score| score.to_string()),
                     },
                     Err(err) => {
                         tracing::warn!("GamesDB fetch_release({id}) failed: {err}");
@@ -182,6 +197,12 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
                             description: None,
                             icon_url: None,
                             cover_url: None,
+                            background_url: None,
+                            developer: None,
+                            publisher: None,
+                            genres: Vec::new(),
+                            release_date: None,
+                            rating: None,
                         }
                     }
                 })
