@@ -142,6 +142,21 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
     /// public catalog data Heroic's launcher uses and tolerates this
     /// access pattern.
     async fn fetch_games(credentials: &C, profile_id: &str) -> Result<Vec<Game>, Status> {
+        let ids = Self::fetch_game_ids(credentials, profile_id).await?;
+
+        tokio::task::spawn_blocking(move || {
+            let http = reqwest::blocking::Client::new();
+            Ok(ids.into_iter().map(|id| resolve_game(&http, id)).collect())
+        })
+        .await
+        .map_err(|err| Status::internal(format!("GOG worker task panicked: {err}")))?
+    }
+
+    /// Just the owned-product-id list — the cheap half of `fetch_games`,
+    /// split out so `WatchGames` can resolve each id's catalog data
+    /// individually and emit it as it arrives, instead of waiting for
+    /// every game in the library to resolve before sending anything.
+    async fn fetch_game_ids(credentials: &C, profile_id: &str) -> Result<Vec<i64>, Status> {
         let stored = credentials
             .load(profile_id, Storefront::Gog)
             .await
@@ -150,69 +165,68 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
 
         let token: Token = serde_json::from_slice(&stored).map_err(error::json)?;
 
-        tokio::task::spawn_blocking(move || {
-            let gog = Gog::new(token);
-            let ids = gog.get_games().map_err(error::api)?;
-            let http = reqwest::blocking::Client::new();
+        tokio::task::spawn_blocking(move || Gog::new(token).get_games().map_err(error::api))
+            .await
+            .map_err(|err| Status::internal(format!("GOG worker task panicked: {err}")))?
+    }
+}
 
-            Ok(ids
-                .into_iter()
-                .map(|id| match gamesdb::fetch_release(&http, id) {
-                    Ok(release) => Game {
-                        id: id.to_string(),
-                        title: release
-                            .title
-                            .resolve()
-                            .unwrap_or_else(|| id.to_string()),
-                        storefront: Storefront::Gog as i32,
-                        description: release.summary.as_ref().and_then(Localized::resolve),
-                        icon_url: release.icon.as_ref().map(Image::resolve),
-                        cover_url: release
-                            .game
-                            .vertical_cover
-                            .as_ref()
-                            .or(release.game.cover.as_ref())
-                            .map(Image::resolve),
-                        background_url: release.game.background.as_ref().map(Image::resolve),
-                        developer: release.game.developers.first().map(|c| c.name.clone()),
-                        publisher: release.game.publishers.first().map(|c| c.name.clone()),
-                        genres: release
-                            .game
-                            .genres
-                            .iter()
-                            .filter_map(|genre| genre.name.resolve())
-                            .collect(),
-                        release_date: release
-                            .game
-                            .first_release_date
-                            .as_deref()
-                            .and_then(gamesdb::parse_release_date),
-                        rating: release.game.aggregated_rating.map(|score| score.to_string()),
-                        install_state: None,
-                    },
-                    Err(err) => {
-                        tracing::warn!("GamesDB fetch_release({id}) failed: {err}");
-                        Game {
-                            id: id.to_string(),
-                            title: id.to_string(),
-                            storefront: Storefront::Gog as i32,
-                            description: None,
-                            icon_url: None,
-                            cover_url: None,
-                            background_url: None,
-                            developer: None,
-                            publisher: None,
-                            genres: Vec::new(),
-                            release_date: None,
-                            rating: None,
-                            install_state: None,
-                        }
-                    }
-                })
-                .collect())
-        })
-        .await
-        .map_err(|err| Status::internal(format!("GOG worker task panicked: {err}")))?
+/// Resolves one owned product id's catalog data via GamesDB. Falls back
+/// to the numeric id as the title on failure rather than dropping the
+/// game — see `fetch_games`' doc comment for why GamesDB and not
+/// `gog::get_game_details`.
+fn resolve_game(http: &reqwest::blocking::Client, id: i64) -> Game {
+    match gamesdb::fetch_release(http, id) {
+        Ok(release) => Game {
+            id: id.to_string(),
+            title: release.title.resolve().unwrap_or_else(|| id.to_string()),
+            storefront: Storefront::Gog as i32,
+            description: release.summary.as_ref().and_then(Localized::resolve),
+            icon_url: release.icon.as_ref().map(Image::resolve),
+            cover_url: release
+                .game
+                .vertical_cover
+                .as_ref()
+                .or(release.game.cover.as_ref())
+                .map(Image::resolve),
+            background_url: release.game.background.as_ref().map(Image::resolve),
+            developer: release.game.developers.first().map(|c| c.name.clone()),
+            publisher: release.game.publishers.first().map(|c| c.name.clone()),
+            genres: release
+                .game
+                .genres
+                .iter()
+                .filter_map(|genre| genre.name.resolve())
+                .collect(),
+            release_date: release
+                .game
+                .first_release_date
+                .as_deref()
+                .and_then(gamesdb::parse_release_date),
+            rating: release
+                .game
+                .aggregated_rating
+                .map(|score| score.to_string()),
+            install_state: None,
+        },
+        Err(err) => {
+            tracing::warn!("GamesDB fetch_release({id}) failed: {err}");
+            Game {
+                id: id.to_string(),
+                title: id.to_string(),
+                storefront: Storefront::Gog as i32,
+                description: None,
+                icon_url: None,
+                cover_url: None,
+                background_url: None,
+                developer: None,
+                publisher: None,
+                genres: Vec::new(),
+                release_date: None,
+                rating: None,
+                install_state: None,
+            }
+        }
     }
 }
 
@@ -375,27 +389,45 @@ impl<C: CredentialStore + Send + Sync + 'static> Store for GogStoreService<C> {
             loop {
                 interval.tick().await;
 
-                let games = match Self::fetch_games(&credentials, &profile_id).await {
-                    Ok(games) => games,
+                let ids = match Self::fetch_game_ids(&credentials, &profile_id).await {
+                    Ok(ids) => ids,
                     Err(err) => {
                         tracing::debug!("WatchGames poll failed for {profile_id}: {err}");
                         continue;
                     }
                 };
 
-                let seen: HashSet<&str> = games.iter().map(|game| game.id.as_str()).collect();
+                // Resolved and reported already in a previous poll —
+                // re-fetching its GamesDB data every tick would be pure
+                // waste, so only ids new since last poll get resolved
+                // (and streamed out) here.
+                let mut seen: HashSet<String> = HashSet::with_capacity(ids.len());
+                for id in ids {
+                    let id_str = id.to_string();
+                    seen.insert(id_str.clone());
+                    if known.contains_key(&id_str) {
+                        continue;
+                    }
 
-                for game in &games {
-                    if !known.contains_key(&game.id) {
-                        known.insert(game.id.clone(), game.clone());
-                        let event = GameEvent {
-                            event: Some(game_event::Event::Added(GameAdded {
-                                game: Some(game.clone()),
-                            })),
-                        };
-                        if tx.send(Ok(event)).await.is_err() {
-                            return;
+                    let game = match tokio::task::spawn_blocking(move || {
+                        let http = reqwest::blocking::Client::new();
+                        resolve_game(&http, id)
+                    })
+                    .await
+                    {
+                        Ok(game) => game,
+                        Err(err) => {
+                            tracing::warn!("GOG worker task panicked: {err}");
+                            continue;
                         }
+                    };
+
+                    known.insert(id_str, game.clone());
+                    let event = GameEvent {
+                        event: Some(game_event::Event::Added(GameAdded { game: Some(game) })),
+                    };
+                    if tx.send(Ok(event)).await.is_err() {
+                        return;
                     }
                 }
 
@@ -461,8 +493,13 @@ impl<C: CredentialStore + Send + Sync + 'static> Store for GogStoreService<C> {
             let mut files = Vec::with_capacity(downloads.len());
             let mut install_size_bytes = Some(0u64);
             for download in downloads {
-                let resolved_url = resolve_download_url(&gog, &download.manual_url)
-                    .map_err(|err| Status::unavailable(format!("GOG download resolution failed for {}: {err}", download.name)))?;
+                let resolved_url =
+                    resolve_download_url(&gog, &download.manual_url).map_err(|err| {
+                        Status::unavailable(format!(
+                            "GOG download resolution failed for {}: {err}",
+                            download.name
+                        ))
+                    })?;
                 let relative_path = resolved_url
                     .rsplit('/')
                     .next()

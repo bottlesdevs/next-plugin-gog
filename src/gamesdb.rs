@@ -71,7 +71,9 @@ pub struct Image {
 
 impl Image {
     pub fn resolve(&self) -> String {
-        self.url_format.replace("{formatter}", "").replace("{ext}", "jpg")
+        self.url_format
+            .replace("{formatter}", "")
+            .replace("{ext}", "jpg")
     }
 }
 
