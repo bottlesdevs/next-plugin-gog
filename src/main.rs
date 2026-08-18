@@ -2,7 +2,7 @@
 //!
 //! Binds an ephemeral port, registers `Gog` with core's Registry
 //! service, keeps that registration alive with a heartbeat loop, then
-//! serves `Store` for the lifetime of the process. Exits immediately if
+//! serves `Plugin` for the lifetime of the process. Exits immediately if
 //! another process already owns the `Gog` storefront.
 
 use std::{sync::Arc, time::Duration};
@@ -13,7 +13,7 @@ use next_proto::bottles::{
     registry::v1::{
         HeartbeatRequest, RegisterOutcome, RegisterPluginRequest, registry_client::RegistryClient,
     },
-    store::v1::store_server::StoreServer,
+    plugin::v1::plugin_server::PluginServer,
 };
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("GOG plugin listening on {endpoint}");
 
     Server::builder()
-        .add_service(StoreServer::new(store_service))
+        .add_service(PluginServer::new(store_service))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await?;
 

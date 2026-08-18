@@ -22,11 +22,11 @@ use gog::{Gog, token::Token};
 use next_proto::bottles::{
     common::v1::{AuthState, Game, LinkedAccount, Storefront},
     library::v1::{GameAdded, GameEvent, GameRemoved, game_event},
-    store::v1::{
+    plugin::v1::{
         BeginLoginRequest, Chunk, CompleteLoginRequest, GetInstallManifestRequest, InstallFile,
         InstallManifest, ListGamesRequest, ListGamesResponse, LoginChallenge,
         OAuthRedirectChallenge, RefreshSessionRequest, RevokeSessionRequest, WatchGamesRequest,
-        login_challenge::Kind, store_server::Store,
+        login_challenge::Kind, plugin_server::Plugin,
     },
 };
 use tokio::sync::{RwLock, mpsc};
@@ -65,7 +65,7 @@ struct PendingChallenge {
     created_at: Instant,
 }
 
-/// GOG storefront plugin, serving `bottles.store.v1.Store` over gRPC.
+/// GOG storefront plugin, serving `bottles.plugin.v1.Plugin` over gRPC.
 /// One instance is created per process (see `main.rs`) and lives for
 /// the plugin's lifetime.
 pub struct GogStoreService<C: CredentialStore> {
@@ -231,7 +231,7 @@ fn resolve_game(http: &reqwest::blocking::Client, id: i64) -> Game {
 }
 
 #[async_trait]
-impl<C: CredentialStore + Send + Sync + 'static> Store for GogStoreService<C> {
+impl<C: CredentialStore + Send + Sync + 'static> Plugin for GogStoreService<C> {
     /// Issues a new login challenge pointing at GOG's OAuth authorization
     /// URL. `profile_id` is unused — the challenge isn't scoped to a
     /// profile until `CompleteLogin`.
@@ -347,7 +347,7 @@ impl<C: CredentialStore + Send + Sync + 'static> Store for GogStoreService<C> {
     }
 
     /// No-op: GOG's API doesn't expose a way to invalidate a session
-    /// server-side, and `ProfileService.UnlinkAccount` drops the stored
+    /// server-side, and `AccountsService.UnlinkAccount` drops the stored
     /// credentials on its own side regardless of this call's outcome.
     async fn revoke_session(
         &self,
