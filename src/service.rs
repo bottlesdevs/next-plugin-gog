@@ -106,7 +106,7 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
             .map_err(error::credentials)?
             .ok_or_else(|| error::credentials(CredentialError::NotFound))?;
 
-        let token: Token = serde_json::from_slice(&stored).map_err(error::json)?;
+        let token: Token = serde_json::from_str(&stored).map_err(error::json)?;
 
         let (user, refreshed_token) = tokio::task::spawn_blocking(move || {
             let gog = Gog::new(token);
@@ -119,7 +119,7 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
 
         let user = user.map_err(error::session_invalid)?;
 
-        let refreshed = serde_json::to_vec(&refreshed_token).map_err(error::json)?;
+        let refreshed = serde_json::to_string(&refreshed_token).map_err(error::json)?;
         credentials
             .save(profile_id, Storefront::Gog, &refreshed)
             .await
@@ -163,7 +163,7 @@ impl<C: CredentialStore + Send + Sync + 'static> GogStoreService<C> {
             .map_err(error::credentials)?
             .ok_or_else(|| error::credentials(CredentialError::NotFound))?;
 
-        let token: Token = serde_json::from_slice(&stored).map_err(error::json)?;
+        let token: Token = serde_json::from_str(&stored).map_err(error::json)?;
 
         tokio::task::spawn_blocking(move || Gog::new(token).get_games().map_err(error::api))
             .await
@@ -308,7 +308,7 @@ impl<C: CredentialStore + Send + Sync + 'static> Plugin for GogStoreService<C> {
 
         tracing::info!("Logged in as {}", user.username);
 
-        let credentials = serde_json::to_vec(&token).map_err(error::json)?;
+        let credentials = serde_json::to_string(&token).map_err(error::json)?;
         self.credentials
             .save(&req.profile_id, Storefront::Gog, &credentials)
             .await
@@ -479,7 +479,7 @@ impl<C: CredentialStore + Send + Sync + 'static> Plugin for GogStoreService<C> {
             .await
             .map_err(error::credentials)?
             .ok_or_else(|| error::credentials(CredentialError::NotFound))?;
-        let token: Token = serde_json::from_slice(&stored).map_err(error::json)?;
+        let token: Token = serde_json::from_str(&stored).map_err(error::json)?;
 
         // The depot API needs a fresh access token; `gog`'s own client
         // transparently refreshes on any authenticated call, so make a
@@ -496,7 +496,7 @@ impl<C: CredentialStore + Send + Sync + 'static> Plugin for GogStoreService<C> {
             .save(
                 &req.profile_id,
                 Storefront::Gog,
-                &serde_json::to_vec(&refreshed).map_err(error::json)?,
+                &serde_json::to_string(&refreshed).map_err(error::json)?,
             )
             .await
             .map_err(error::credentials)?;
@@ -507,19 +507,24 @@ impl<C: CredentialStore + Send + Sync + 'static> Plugin for GogStoreService<C> {
         let builds = depot::get_builds(&http, access_token, game_id)
             .await
             .map_err(|err| Status::unavailable(format!("GOG builds lookup failed: {err}")))?;
-        let build = depot::select_build(&builds)
-            .ok_or_else(|| Status::not_found(format!("no builds available for GOG game {game_id}")))?;
+        let build = depot::select_build(&builds).ok_or_else(|| {
+            Status::not_found(format!("no builds available for GOG game {game_id}"))
+        })?;
 
         let meta = depot::get_build_meta(&http, access_token, &build.link)
             .await
-            .map_err(|err| Status::unavailable(format!("GOG build manifest fetch failed: {err}")))?;
+            .map_err(|err| {
+                Status::unavailable(format!("GOG build manifest fetch failed: {err}"))
+            })?;
         let depot_meta = depot::select_depot(&meta).ok_or_else(|| {
             Status::failed_precondition(format!("no compatible depot for GOG game {game_id}"))
         })?;
 
         let depot_files = depot::get_depot_files(&http, &depot_meta.manifest)
             .await
-            .map_err(|err| Status::unavailable(format!("GOG depot manifest fetch failed: {err}")))?;
+            .map_err(|err| {
+                Status::unavailable(format!("GOG depot manifest fetch failed: {err}"))
+            })?;
         let secure_link = depot::get_secure_link(&http, access_token, game_id, "/")
             .await
             .map_err(|err| Status::unavailable(format!("GOG secure_link lookup failed: {err}")))?;
